@@ -35,6 +35,7 @@ PLUGIN_NAME = "API Xref Hunter"
 SETTINGS_GROUP = "apiXrefHunter"
 PRESETS_KEY = f"{SETTINGS_GROUP}.presets"
 LAST_QUERY_KEY = f"{SETTINGS_GROUP}.lastQuery"
+FUNCTION_COLUMN_WIDTH_KEY = f"{SETTINGS_GROUP}.functionColumnWidth"
 TAG_TYPE_NAME = "API Hit"
 
 MATCH_MODES = ["glob", "exact", "substring", "regex"]
@@ -148,7 +149,21 @@ def register_settings() -> bool:
                 "default": "",
             }),
         )
-        _SETTINGS_OK = bool(ok_presets and ok_last)
+        ok_width = settings.register_setting(
+            FUNCTION_COLUMN_WIDTH_KEY,
+            json.dumps({
+                "title": "Sidebar function column width",
+                "description": (
+                    "Width in pixels of the sidebar's Function column, i.e. where "
+                    "the separator between Function and Address sits. Set by "
+                    "dragging that separator; 0 (the default) sizes the column to "
+                    "its contents instead."
+                ),
+                "type": "string",
+                "default": "0",
+            }),
+        )
+        _SETTINGS_OK = bool(ok_presets and ok_last and ok_width)
         if not _SETTINGS_OK:
             log_warn(f"{PLUGIN_NAME}: settings registration was rejected; "
                      f"presets will be stored in {_preset_file()} instead.")
