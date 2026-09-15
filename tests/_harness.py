@@ -79,13 +79,17 @@ def _install_stubs():
             self.run()
 
     class PluginCommand:
-        @staticmethod
-        def register(*_a, **_kw):
-            return None
+        """Records what the plugin registers, so tests can assert on it."""
 
-        @staticmethod
-        def register_for_function(*_a, **_kw):
-            return None
+        registered = []
+
+        @classmethod
+        def register(cls, name, *_a, **_kw):
+            cls.registered.append(name)
+
+        @classmethod
+        def register_for_function(cls, name, *_a, **_kw):
+            cls.registered.append(name)
 
     plugin.BackgroundTaskThread = BackgroundTaskThread
     plugin.PluginCommand = PluginCommand
@@ -99,6 +103,11 @@ def _install_stubs():
     sys.modules["binaryninja.log"] = log
     sys.modules["binaryninja.plugin"] = plugin
     sys.modules["binaryninja.interaction"] = interaction
+
+
+def registered_commands():
+    """Command names the plugin registered at import time."""
+    return list(sys.modules["binaryninja.plugin"].PluginCommand.registered)
 
 
 def load_plugin():

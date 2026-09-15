@@ -16,6 +16,10 @@ Headless use:
         result = find_api_callers(bv, ["Reg*Key*"], max_depth=2)
         targets = resolve_targets(bv, ["Reg*Key*"])
         print(reaches(bv, bv.get_function_at(0x401000), targets))
+
+        # and what the binary *does* with what a registry read returned
+        for guard in find_api_branches(bv, ["Reg*Key*"]).guards:
+            print(guard_summary(guard))
 """
 
 import json
@@ -25,6 +29,12 @@ from binaryninja import BinaryView, core_ui_enabled
 from binaryninja.log import log_error, log_info
 from binaryninja.plugin import BackgroundTaskThread, PluginCommand
 
+from .branches import (
+    DEFAULT_MAX_HOPS,
+    build_branch_report,
+    find_api_branches,
+    guard_summary,
+)
 from .core import (
     DEFAULT_PRESETS,
     LAST_QUERY_KEY,
@@ -279,6 +289,129 @@ def _check_reach(bv: BinaryView, func) -> None:
 
 
 # --------------------------------------------------------------------------
+# Branch analysis: what the binary does with an API's result
+# --------------------------------------------------------------------------
+
+class _BranchTask(BackgroundTaskThread):
+    def __init__(self, bv, patterns, mode, max_hops, functions=None):
+        super().__init__(f"{PLUGIN_NAME}: branches…", can_cancel=True)
+        self.bv = bv
+        self.patterns = patterns
+        self.mode = mode
+        self.max_hops = max_hops
+        self.functions = functions
+
+    def run(self):
+        def progress(done, total):
+            if self.cancelled:
+                raise KeyboardInterrupt()
+            self.progress = f"{PLUGIN_NAME}: {done}/{total} function(s)"
+
+        try:
+            result = find_api_branches(
+                self.bv,
+                self.patterns,
+                mode=self.mode,
+                max_hops=self.max_hops,
+                functions=self.functions,
+                progress=progress,
+            )
+        except KeyboardInterrupt:
+            log_info(f"{PLUGIN_NAME}: cancelled.")
+            return
+        except Exception as exc:
+            log_error(f"{PLUGIN_NAME}: branch analysis failed: {exc}")
+            return
+
+        log_info(f"{PLUGIN_NAME}: {len(result.guards)} branch(es) on an API "
+                 f"result, from {result.call_sites} call site(s).")
+        for guard in result.guards:
+            log_info("  " + guard_summary(guard))
+        for call in result.untested:
+            log_info(f"  {call.function.name} @ {hex(call.call_site)}: "
+                     f"{call.api} result is never tested here")
+
+        report = build_branch_report(result,
+                                     getattr(self.bv.file, "filename", "") or "")
+        try:
+            self.bv.show_markdown_report(f"{PLUGIN_NAME} — branches", report, report)
+        except Exception:
+            log_info(report)
+
+
+def _ask_branch_patterns(title: str, prompt: str):
+    """Shared form for the two branch commands. Returns (patterns, mode, hops)."""
+    from binaryninja.interaction import (
+        ChoiceField, MultilineTextField, SeparatorField, TextLineField,
+        get_form_input,
+    )
+
+    presets = load_presets()
+    preset_names = ["(use the box below)"] + sorted(presets.keys())
+    preset_field = ChoiceField("Preset", preset_names, 1)
+    names_field = MultilineTextField("API names / patterns", get_setting(LAST_QUERY_KEY, ""))
+    mode_field = ChoiceField("Match mode", MATCH_MODES, 0)
+    hops_field = TextLineField(
+        "Max assignments between the call and the test", str(DEFAULT_MAX_HOPS)
+    )
+
+    if not get_form_input(
+        [prompt, SeparatorField(), preset_field, names_field,
+         SeparatorField(), mode_field, hops_field],
+        title,
+    ):
+        return None
+
+    patterns: List[str] = []
+    chosen = preset_names[preset_field.result]
+    if chosen != preset_names[0]:
+        patterns.extend(presets.get(chosen, []))
+    raw = (names_field.result or "").strip()
+    for chunk in raw.replace(",", "\n").splitlines():
+        chunk = chunk.strip()
+        if chunk and not chunk.startswith("#"):
+            patterns.append(chunk)
+    patterns = list(dict.fromkeys(patterns))
+    if not patterns:
+        log_error(f"{PLUGIN_NAME}: no patterns given.")
+        return None
+    if raw:
+        set_setting(LAST_QUERY_KEY, raw)
+
+    try:
+        hops = max(0, int((hops_field.result or "").strip()))
+    except ValueError:
+        hops = DEFAULT_MAX_HOPS
+
+    return patterns, MATCH_MODES[mode_field.result], hops
+
+
+def _find_branches(bv: BinaryView) -> None:
+    """Every conditional in the binary whose outcome depends on an API result."""
+    asked = _ask_branch_patterns(
+        f"{PLUGIN_NAME} — branches on API results",
+        "Find the conditionals that test what these APIs returned, and the "
+        "code each arm of those conditionals guards.",
+    )
+    if asked is None:
+        return
+    patterns, mode, hops = asked
+    _BranchTask(bv, patterns, mode, hops).start()
+
+
+def _find_branches_here(bv: BinaryView, func) -> None:
+    """The same question, scoped to one function."""
+    asked = _ask_branch_patterns(
+        f"{PLUGIN_NAME} — branches in {func.name}",
+        f"What does {func.name} do differently depending on these APIs' results?",
+    )
+    if asked is None:
+        return
+    patterns, mode, hops = asked
+    _BranchTask(bv, patterns, mode, hops, functions=[func]).start()
+
+
+# --------------------------------------------------------------------------
 # Registration
 # --------------------------------------------------------------------------
 
@@ -292,6 +425,18 @@ PluginCommand.register_for_function(
     f"{PLUGIN_NAME}\\Does this function reach an API?…",
     "Check whether this function ever reaches a matching API, directly or via a chain",
     _check_reach,
+)
+
+PluginCommand.register(
+    f"{PLUGIN_NAME}\\Find branches on API results…",
+    "Find every conditional whose outcome depends on what an API returned",
+    _find_branches,
+)
+
+PluginCommand.register_for_function(
+    f"{PLUGIN_NAME}\\Branches on API results in this function…",
+    "Show what this function does differently depending on an API's result",
+    _find_branches_here,
 )
 
 for _name in sorted(DEFAULT_PRESETS.keys()):

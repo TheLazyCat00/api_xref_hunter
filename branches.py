@@ -235,15 +235,22 @@ def _ssa_var_uses(il, ssa_var) -> List:
     return resolved
 
 
-def _call_at(il, addr: int):
-    """The MLIL SSA call instruction at `addr`, or None."""
+def _call_index(il) -> Dict[int, object]:
+    """
+    Every MLIL SSA call in the function, keyed by address.
+
+    Built once per function rather than per call site: a dispatcher that funnels
+    a hundred API calls would otherwise rescan the whole instruction list a
+    hundred times.
+    """
+    index: Dict[int, object] = {}
     try:
         for inst in il.instructions:
-            if inst.address == addr and _op(inst) in _CALL_OPS:
-                return inst
+            if _op(inst) in _CALL_OPS:
+                index.setdefault(inst.address, inst)
     except Exception:
-        return None
-    return None
+        pass
+    return index
 
 
 def _output_vars(call_inst) -> List:
@@ -532,11 +539,12 @@ def analyze_function_branches(
         return [], []
 
     graph, blocks, entry = _block_graph(il)
+    calls = _call_index(il)
     guards: List[ApiGuard] = []
     untested: List[UntestedCall] = []
 
     for call_addr, api in sites:
-        call_inst = _call_at(il, call_addr)
+        call_inst = calls.get(call_addr)
         if call_inst is None:
             continue
         call_block = None
@@ -736,3 +744,19 @@ def build_branch_report(result: BranchResult, binary_name: str = "") -> str:
         lines.append("`" + "`, `".join(result.unmatched_patterns) + "`")
 
     return "\n".join(lines)
+
+
+def guard_summary(guard: ApiGuard) -> str:
+    """One line per guard, for the log and the sidebar status bar."""
+    def arm(side: GuardedSide) -> str:
+        if side.is_empty:
+            return "nothing"
+        names = side.call_names
+        if not names:
+            return "returns" if side.returns else "no calls"
+        shown = ", ".join(names[:3])
+        return shown + (f" (+{len(names) - 3})" if len(names) > 3 else "")
+
+    return (f"{guard.function.name} @ {hex(guard.call_site)}: {guard.api} -> "
+            f"if ({guard.condition}) at {hex(guard.condition_site)} "
+            f"[true: {arm(guard.true_side)}] [false: {arm(guard.false_side)}]")

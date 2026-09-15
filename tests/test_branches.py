@@ -177,6 +177,80 @@ class TestPropagation(unittest.TestCase):
         self.assertEqual(guard.false_side.blocks, 0)
 
 
+class TestSeveralTests(unittest.TestCase):
+    """One result tested twice — `if (res != 0) ... if (res == 2) ...`."""
+
+    def setUp(self):
+        eax = h.SSAVariable(h.Variable("eax"), 1)
+        instructions = [
+            call(0x1000, REG_QUERY, output=[eax]),
+            branch(0x1006,
+                   h.cmp_expr("MLIL_CMP_NE", h.var_ssa(eax), h.const(0), "!="),
+                   2, 3, reads=[eax]),
+            call(0x1010, EXIT_PROCESS),
+            branch(0x1020,
+                   h.cmp_expr("MLIL_CMP_E", h.var_ssa(eax), h.const(2), "=="),
+                   4, 5, reads=[eax]),
+            call(0x1030, WRITE_FILE),
+            h.Expr("MLIL_RET", [], address=0x1040),
+        ]
+        self.func = diamond_function(
+            instructions,
+            [(0, 2), (2, 3), (3, 4), (4, 5), (5, 6)],
+            {0: [1, 2], 1: [2], 2: [3, 4], 3: [4], 4: []},
+        )
+        self.bv = build_bv([self.func])
+        self.guards, _ = branches.analyze_function_branches(
+            self.bv, self.func, [(0x1000, "RegQueryValueExW")])
+
+    def test_both_conditionals_are_reported(self):
+        self.assertEqual(len(self.guards), 2)
+        self.assertEqual([g.condition_site for g in self.guards], [0x1006, 0x1020])
+        self.assertEqual([g.condition for g in self.guards],
+                         ["eax#1 != 0", "eax#1 == 2"])
+
+    def test_each_guards_only_its_own_arm(self):
+        first, second = self.guards
+        self.assertEqual(first.true_side.call_names, ["ExitProcess"])
+        self.assertEqual(second.true_side.call_names, ["WriteFile"])
+
+
+class TestMultipleCallSites(unittest.TestCase):
+    """Two calls in one function are analysed independently."""
+
+    def setUp(self):
+        first = h.SSAVariable(h.Variable("eax"), 1)
+        second = h.SSAVariable(h.Variable("eax"), 2)
+        instructions = [
+            call(0x1000, REG_QUERY, output=[first]),
+            branch(0x1006,
+                   h.cmp_expr("MLIL_CMP_NE", h.var_ssa(first), h.const(0), "!="),
+                   2, 3, reads=[first]),
+            call(0x1010, EXIT_PROCESS),
+            call(0x1020, REG_QUERY, output=[second]),
+            branch(0x1026,
+                   h.cmp_expr("MLIL_CMP_NE", h.var_ssa(second), h.const(0), "!="),
+                   5, 6, reads=[second]),
+            call(0x1030, CREATE_PROCESS),
+            h.Expr("MLIL_RET", [], address=0x1040),
+        ]
+        self.func = diamond_function(
+            instructions,
+            [(0, 2), (2, 3), (3, 5), (5, 6), (6, 7)],
+            {0: [1, 2], 1: [2], 2: [3, 4], 3: [4], 4: []},
+        )
+        self.bv = build_bv([self.func])
+        self.guards, _ = branches.analyze_function_branches(
+            self.bv, self.func,
+            [(0x1000, "RegQueryValueExW"), (0x1020, "RegQueryValueExW")])
+
+    def test_each_call_gets_its_own_guard(self):
+        self.assertEqual(len(self.guards), 2)
+        self.assertEqual([g.call_site for g in self.guards], [0x1000, 0x1020])
+        self.assertEqual(self.guards[0].true_side.call_names, ["ExitProcess"])
+        self.assertEqual(self.guards[1].true_side.call_names, ["CreateProcessW"])
+
+
 class TestOutParameter(unittest.TestCase):
     """The data a registry read hands back arrives through `&var`, not eax."""
 
