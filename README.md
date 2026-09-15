@@ -64,6 +64,12 @@ The **Reaches?** button answers the single-function question: does whatever
 the cursor is currently inside ever reach a matching API? It shows the
 shortest call chain, one hop per row, each row navigable.
 
+Drag the divider between the **Function** and **Address** columns to split the
+tree however you like — long mangled names get more room, or the addresses do.
+The position is remembered across sessions in `apiXrefHunter.functionColumnWidth`
+(pixels; `0` means size to contents). Double-click the divider to fit the
+Function column to its contents again.
+
 ### Other output
 
 - A **markdown report** tab with `binaryninja://` links, for the menu commands.

@@ -42,6 +42,11 @@ from . import core
 
 WIDGET_NAME = "API Hunter"
 
+# Starting width of the Function column, in pixels; the user drags the
+# divider from there and the new position is remembered across sessions.
+DEFAULT_FUNCTION_COLUMN_WIDTH = 180
+MIN_COLUMN_WIDTH = 40
+
 
 def _navigate(widget, addr: int) -> None:
     """Jump the active view to `addr`, tolerant of API differences."""
@@ -180,10 +185,9 @@ class ApiHunterSidebarWidget(SidebarWidget):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Function", "Address"])
         self.tree.setColumnCount(2)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tree.setAlternatingRowColors(True)
         self.tree.itemDoubleClicked.connect(self._item_activated)
+        self._setup_header()
         layout.addWidget(self.tree, 1)
 
         self.status = QLabel("Enter API names or pick a preset, then Scan.")
@@ -191,6 +195,53 @@ class ApiHunterSidebarWidget(SidebarWidget):
         layout.addWidget(self.status)
 
         self.setLayout(layout)
+
+    # -- column layout -----------------------------------------------------
+
+    def _setup_header(self):
+        """
+        Make the Function/Address divider draggable and remember where it lands.
+
+        Both sections are Interactive (Stretch and ResizeToContents would each
+        pin the divider in place), with the last section stretching so the
+        Address column simply takes whatever the Function column leaves.
+        Double-clicking the divider auto-fits the Function column to its
+        contents, which is how a width is undone.
+        """
+        header = self.tree.header()
+        header.setSectionsMovable(False)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(MIN_COLUMN_WIDTH)
+        header.setCascadingSectionResizes(False)
+
+        width = self._stored_column_width()
+        self.tree.setColumnWidth(0, width if width else DEFAULT_FUNCTION_COLUMN_WIDTH)
+
+        # Writing a setting on every pixel of a drag would be wasteful, so the
+        # save is debounced until the drag settles.
+        self._width_save_timer = QtCore.QTimer(self)
+        self._width_save_timer.setSingleShot(True)
+        self._width_save_timer.setInterval(500)
+        self._width_save_timer.timeout.connect(self._save_column_width)
+        header.sectionResized.connect(self._column_resized)
+
+    def _stored_column_width(self) -> int:
+        """Last width the user dragged the divider to, or 0 if never set."""
+        try:
+            width = int(core.get_setting(core.FUNCTION_COLUMN_WIDTH_KEY, "0") or 0)
+        except ValueError:
+            return 0
+        return width if width >= MIN_COLUMN_WIDTH else 0
+
+    def _column_resized(self, index, _old, _new):
+        if index == 0:
+            self._width_save_timer.start()
+
+    def _save_column_width(self):
+        core.set_setting(core.FUNCTION_COLUMN_WIDTH_KEY,
+                         str(self.tree.columnWidth(0)))
 
     # -- sidebar callbacks -------------------------------------------------
 
