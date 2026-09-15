@@ -410,6 +410,7 @@ class ApiHunterSidebarWidget(SidebarWidget):
         ).start()
 
     def check_branches(self):
+        """Analyse what the function at the cursor does with these APIs' results."""
         func = self._function_at_cursor()
         if func is None:
             return

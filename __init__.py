@@ -293,6 +293,8 @@ def _check_reach(bv: BinaryView, func) -> None:
 # --------------------------------------------------------------------------
 
 class _BranchTask(BackgroundTaskThread):
+    """Runs branch analysis off the UI thread, then logs and reports it."""
+
     def __init__(self, bv, patterns, mode, max_hops, functions=None):
         super().__init__(f"{PLUGIN_NAME}: branches…", can_cancel=True)
         self.bv = bv

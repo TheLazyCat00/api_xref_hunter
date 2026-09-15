@@ -102,10 +102,12 @@ class GuardedSide:
 
     @property
     def label(self) -> str:
+        """How this arm reads in a report: "when true" / "when false"."""
         return "when true" if self.taken else "when false"
 
     @property
     def call_names(self) -> List[str]:
+        """The distinct functions this arm calls, in the order they appear."""
         return list(dict.fromkeys(name for _, name in self.calls))
 
     @property
@@ -129,6 +131,7 @@ class ApiGuard:
 
     @property
     def sides(self) -> List[GuardedSide]:
+        """Both arms, for reporting them together."""
         return [self.true_side, self.false_side]
 
 
@@ -155,6 +158,7 @@ class BranchResult:
         return len(self.guards)
 
     def by_function(self) -> Dict[int, List[ApiGuard]]:
+        """Guards grouped by the function they were found in, keyed by address."""
         out: Dict[int, List[ApiGuard]] = defaultdict(list)
         for guard in self.guards:
             out[guard.function.start].append(guard)
@@ -779,6 +783,13 @@ def _side_row(side: GuardedSide) -> str:
 
 
 def build_branch_report(result: BranchResult, binary_name: str = "") -> str:
+    """
+    Render a `BranchResult` as markdown with `binaryninja://` navigation links.
+
+    Each guard becomes a heading naming the API and where its result came from,
+    and a two-row table — one per arm — saying what that arm guards. Calls no
+    branch tests get their own section at the end.
+    """
     lines = [f"# {PLUGIN_NAME} — branches on API results", ""]
     if binary_name:
         lines.append(f"**Binary:** `{binary_name}`  ")
