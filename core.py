@@ -155,8 +155,9 @@ def register_settings() -> bool:
                 "title": "Sidebar function column width",
                 "description": (
                     "Width in pixels of the sidebar's Function column, i.e. where "
-                    "the separator between Function and Address sits. Updated "
-                    "whenever the separator is dragged; 0 means size to contents."
+                    "the separator between Function and Address sits. Set by "
+                    "dragging that separator; 0 (the default) sizes the column to "
+                    "its contents instead."
                 ),
                 "type": "string",
                 "default": "0",

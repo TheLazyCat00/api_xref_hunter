@@ -42,10 +42,14 @@ from . import core
 
 WIDGET_NAME = "API Hunter"
 
-# Starting width of the Function column, in pixels; the user drags the
-# divider from there and the new position is remembered across sessions.
-DEFAULT_FUNCTION_COLUMN_WIDTH = 180
+# Narrowest either column may be dragged, in pixels. A stored width below
+# this is treated as unset, i.e. as "size the Function column to its contents".
 MIN_COLUMN_WIDTH = 40
+
+# Sizing to contents is capped at this fraction of the panel: sidebars are
+# narrow and a long mangled name would otherwise push Address out of sight.
+# Dragging is not capped — a width the user picked is a width they meant.
+MAX_AUTO_FIT_FRACTION = 0.6
 
 
 def _navigate(widget, addr: int) -> None:
@@ -205,8 +209,10 @@ class ApiHunterSidebarWidget(SidebarWidget):
         Both sections are Interactive (Stretch and ResizeToContents would each
         pin the divider in place), with the last section stretching so the
         Address column simply takes whatever the Function column leaves.
-        Double-clicking the divider auto-fits the Function column to its
-        contents, which is how a width is undone.
+
+        Dragging the divider pins a width, which is stored and restored next
+        time. Double-clicking it clears that width again, back to sizing the
+        Function column to whatever the results happen to be.
         """
         header = self.tree.header()
         header.setSectionsMovable(False)
@@ -216,30 +222,75 @@ class ApiHunterSidebarWidget(SidebarWidget):
         header.setMinimumSectionSize(MIN_COLUMN_WIDTH)
         header.setCascadingSectionResizes(False)
 
-        width = self._stored_column_width()
-        self.tree.setColumnWidth(0, width if width else DEFAULT_FUNCTION_COLUMN_WIDTH)
-
         # Writing a setting on every pixel of a drag would be wasteful, so the
         # save is debounced until the drag settles.
+        self._suppress_width_save = False
         self._width_save_timer = QtCore.QTimer(self)
         self._width_save_timer.setSingleShot(True)
         self._width_save_timer.setInterval(500)
         self._width_save_timer.timeout.connect(self._save_column_width)
         header.sectionResized.connect(self._column_resized)
+        header.sectionHandleDoubleClicked.connect(self._divider_double_clicked)
+
+        self.apply_column_width()
 
     def _stored_column_width(self) -> int:
-        """Last width the user dragged the divider to, or 0 if never set."""
+        """The pinned Function column width, or 0 to size it to contents."""
         try:
             width = int(core.get_setting(core.FUNCTION_COLUMN_WIDTH_KEY, "0") or 0)
         except ValueError:
             return 0
         return width if width >= MIN_COLUMN_WIDTH else 0
 
+    def apply_column_width(self):
+        """
+        Restore the pinned width, or fit the Function column to its contents.
+
+        Called again after every repopulate so that an unpinned column keeps
+        tracking the names actually on screen, within the cap below.
+        """
+        width = self._stored_column_width()
+        self._suppress_width_save = True
+        try:
+            if width:
+                self.tree.setColumnWidth(0, width)
+            else:
+                self.tree.resizeColumnToContents(0)
+                self._cap_auto_fit()
+        finally:
+            self._suppress_width_save = False
+
+    def _cap_auto_fit(self):
+        """Keep a fitted column from crowding the Address column off the panel."""
+        viewport = self.tree.viewport().width()
+        if viewport <= MIN_COLUMN_WIDTH * 2:  # not laid out yet; nothing to cap against
+            return
+        limit = int(viewport * MAX_AUTO_FIT_FRACTION)
+        if self.tree.columnWidth(0) > limit:
+            self.tree.setColumnWidth(0, limit)
+
     def _column_resized(self, index, _old, _new):
-        if index == 0:
+        """Queue a save when the user drags the divider, not when we resize."""
+        if index == 0 and not self._suppress_width_save:
             self._width_save_timer.start()
 
+    def _divider_double_clicked(self, index):
+        """Unpin the column: Qt fits it to contents and it stays that way."""
+        if index != 0:
+            return
+        self._width_save_timer.stop()
+        core.set_setting(core.FUNCTION_COLUMN_WIDTH_KEY, "0")
+        # Qt does its own fit once this slot returns; that resize is ours, not
+        # the user pinning a width, so it must not be saved back.
+        self._suppress_width_save = True
+        QtCore.QTimer.singleShot(0, self._resume_width_save)
+
+    def _resume_width_save(self):
+        """Re-arm saving once Qt's own fit-to-contents resize has gone through."""
+        self._suppress_width_save = False
+
     def _save_column_width(self):
+        """Pin the width the divider was dragged to, for the next session."""
         core.set_setting(core.FUNCTION_COLUMN_WIDTH_KEY,
                          str(self.tree.columnWidth(0)))
 
@@ -353,6 +404,7 @@ class ApiHunterSidebarWidget(SidebarWidget):
 
         add_group("Direct callers", direct)
         add_group("Indirect callers", indirect)
+        self.apply_column_width()
 
         total_sites = sum(result.matched_symbols.values())
         msg = (f"{len(direct)} direct"
@@ -383,6 +435,7 @@ class ApiHunterSidebarWidget(SidebarWidget):
             if fn is not None:
                 item.setData(0, Qt.UserRole, fn.start)
                 item.setText(1, hex(fn.start))
+        self.apply_column_width()
         self.set_status(f"Shortest chain: {len(chain) - 1} hop(s).")
 
 
