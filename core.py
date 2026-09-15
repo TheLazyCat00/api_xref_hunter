@@ -280,6 +280,27 @@ def _symbol_names(sym) -> Set[str]:
     return names
 
 
+def unmatched_patterns(
+    patterns: Sequence[str],
+    matched_names: Iterable[str],
+    mode: str = "glob",
+    case_sensitive: bool = False,
+) -> List[str]:
+    """
+    Which patterns resolved to no symbol at all.
+
+    That is the signal that an API is either absent from the binary or resolved
+    dynamically at runtime, so it is worth reporting rather than passing over.
+    """
+    names = list(matched_names)
+    out = []
+    for pattern in patterns:
+        single = _build_matcher([pattern], mode, case_sensitive)
+        if not any(single(name) for name in names):
+            out.append(pattern)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Results
 # --------------------------------------------------------------------------
@@ -399,11 +420,8 @@ def find_api_callers(
     result.callers = sorted(hits.values(), key=lambda h: (h.depth, h.name.lower()))
 
     # 4. Report patterns that matched nothing at all.
-    matched_names = set(targets.values())
-    for pat in patterns:
-        single = _build_matcher([pat], mode, case_sensitive)
-        if not any(single(n) for n in matched_names):
-            result.unmatched_patterns.append(pat)
+    result.unmatched_patterns = unmatched_patterns(
+        patterns, set(targets.values()), mode, case_sensitive)
 
     return result
 
