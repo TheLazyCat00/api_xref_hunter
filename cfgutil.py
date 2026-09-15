@@ -26,13 +26,21 @@ def reachable(
 
     `skip_edge` drops a single `(src, dst)` edge for the walk, which is how
     `guarded_region` asks "could control get here some other way?".
+
+    Exactly one matching edge is dropped, not every copy of it. A block with
+    two edges to the same target — both arms of a conditional jumping to one
+    place — still reaches that target with one edge removed, and reporting it
+    as unreachable would credit the branch with guarding code that runs either
+    way.
     """
     seen = {start}
     stack = [start]
+    skipped = False
     while stack:
         node = stack.pop()
         for succ in graph.get(node, ()):
-            if skip_edge is not None and (node, succ) == skip_edge:
+            if not skipped and skip_edge is not None and (node, succ) == skip_edge:
+                skipped = True
                 continue
             if succ in seen:
                 continue

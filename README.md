@@ -73,7 +73,7 @@ guards:
 
 ```
 cfg_load
-  RegQueryValueExW at 0x401234 — out-parameter 2 (&var_10)
+  RegQueryValueExW at 0x401234 — pointer argument 5 (&var_10)
   Branch at 0x401240:  if (var_10 == 0)  — 1 assignment(s) later
 
     when true   0x401250   1 block    RegSetValueExW, WriteFile
@@ -86,18 +86,27 @@ What it follows:
   condition of an `if`. Each assignment in between is a *hop*, and the hop
   budget is configurable (6 by default) — raising it finds longer chains and
   more unrelated variables with them.
-- **Out-parameters**, i.e. arguments passed as `&var`. This matters more than
-  the return value for the registry: `RegQueryValueExW` returns a status code,
-  but the data you branch on comes back through the buffer pointer.
+- **Pointer arguments**, i.e. anything passed as `&var`. This matters more
+  than the return value for the registry: `RegQueryValueExW` returns a status
+  code, but the data you branch on comes back through the buffer pointer.
+  Nothing in the IL says which pointer arguments the API writes to, so they are
+  reported as *pointer argument N* rather than as confirmed out-parameters.
+  Two filters keep the obvious false leads out: a parameter the callee's type
+  declares pointer-to-const is an input by declaration and is skipped, and a
+  version of the variable that the caller itself assigns after the call holds
+  the caller's value rather than the API's, so `Api(&status); status = 1;
+  if (status)` is not attributed to `Api`.
 
 What each arm reports is the set of blocks that run *only* because the branch
 went that way. The merge block both arms fall back into belongs to neither, so
 an arm that reports `CreateProcessW` really does gate that call, and an arm
 that guards nothing says so instead of claiming the rest of the function.
 
-Calls whose result nothing tests get their own section, naming where the value
-went instead — returned, passed to another function, stored, or simply unused.
-An ignored return value is a finding too.
+Calls whose result no conditional here tests get their own section, naming
+where the value went instead — returned, passed to another function, stored, or
+simply unused. That is "not branch-tested in this function", not "ignored": a
+status code handed to a caller is still being checked, just not here. Either
+way it is worth seeing.
 
 ### Which arm is success?
 
@@ -189,7 +198,8 @@ with binaryninja.load("sample.exe") as bv:
             print(" ", side.label, side.call_names, "returns" if side.returns else "")
 
     for call in result.untested:
-        print(f"{call.api} @ {hex(call.call_site)} result ignored: {call.fate}")
+        print(f"{call.api} @ {hex(call.call_site)} not branch-tested here:",
+              call.fate)
 
     print(build_branch_report(result, "sample.exe"))
 ```
@@ -228,10 +238,12 @@ Branch analysis adds its own:
 - **It stops at the function boundary.** A result that is returned, or handed
   to a helper that does the testing, is reported as untested *here*, naming
   where the value went. Follow it yourself from there.
-- **Out-parameters are tracked by variable, not by memory.** The API's write
-  through the pointer is invisible in the caller's IL, so reads of that
+- **Pointer arguments are tracked by variable, not by memory.** The API's
+  write through the pointer is invisible in the caller's IL, so reads of that
   variable from the call site onward are assumed to carry what the API stored.
-  A variable the compiler reuses later for something else can over-report.
+  Past the two filters above, an input-only pointer into a callee with no type
+  information — `&si` to an untyped `CreateProcessW` — can still produce a
+  guard the API did not cause. Read the `origin` before trusting one.
 - **A missing branch is not proof of a missing check.** The value may be tested
   through a path the hop budget cut off, in a caller, or by a construct MLIL
   models differently. Treat it as "nothing found", not "nothing there".

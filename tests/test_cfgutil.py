@@ -32,6 +32,12 @@ class TestReachable(unittest.TestCase):
         # The dropped edge is directional and specific to that pair.
         self.assertEqual(reachable(graph, 0, skip_edge=(1, 0)), {0, 1, 2, 3})
 
+    def test_skip_edge_drops_one_copy_not_every_copy(self):
+        # A block with two edges to the same target still reaches it when one
+        # of them is removed.
+        graph = {0: [1, 1], 1: []}
+        self.assertEqual(reachable(graph, 0, skip_edge=(0, 1)), {0, 1})
+
     def test_unknown_node_has_no_successors(self):
         self.assertEqual(reachable({}, 7), {7})
 
@@ -68,6 +74,12 @@ class TestGuardedRegion(unittest.TestCase):
         graph = {0: [1, 2], 1: [], 2: [3], 3: []}
         self.assertEqual(guarded_region(graph, 0, 0, 1), {1})
         self.assertEqual(guarded_region(graph, 0, 0, 2), {2, 3})
+
+    def test_both_arms_jumping_to_one_block_guard_nothing(self):
+        # `if (c) goto L; else goto L;` — L runs either way, so neither arm
+        # guards it.
+        graph = {0: [1, 1], 1: []}
+        self.assertEqual(guarded_region(graph, 0, 0, 1), set())
 
     def test_target_reachable_another_way_guards_nothing(self):
         # 1 is also entered from 4, so reaching 1 does not imply the branch

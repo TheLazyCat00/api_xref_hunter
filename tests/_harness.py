@@ -244,10 +244,34 @@ class ILFunction:
 
 
 class Function:
-    def __init__(self, name, start, il):
+    def __init__(self, name, start, il, parameters=None):
         self.name = name
         self.start = start
         self.mlil = il
+        self.function_type = (FunctionType(parameters)
+                              if parameters is not None else None)
+
+
+class Type:
+    """Just enough of a Binary Ninja type: a pointer knows its pointee."""
+
+    def __init__(self, const=False, target=None):
+        self.const = const
+        self.target = target
+
+
+def pointer_to(const=False):
+    return Type(target=Type(const=const))
+
+
+class Parameter:
+    def __init__(self, type_):
+        self.type = type_
+
+
+class FunctionType:
+    def __init__(self, parameters):
+        self.parameters = list(parameters)
 
 
 class Symbol:

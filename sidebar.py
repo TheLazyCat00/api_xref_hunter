@@ -138,7 +138,10 @@ class _BranchTask(BackgroundTaskThread):
     """What does the function at the cursor do with these APIs' results?"""
 
     def __init__(self, widget, bv, func, patterns, mode):
-        super().__init__("API Hunter: branches…", can_cancel=True)
+        # One function's worth of analysis, with no interruption point to
+        # check a cancel flag at — offering a cancel button that does nothing
+        # would be worse than not offering one.
+        super().__init__("API Hunter: branches…", can_cancel=False)
         self.widget = widget
         self.bv = bv
         self.func = func

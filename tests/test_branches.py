@@ -278,8 +278,123 @@ class TestOutParameter(unittest.TestCase):
     def test_tracks_the_variable_whose_address_was_passed(self):
         self.assertEqual(len(self.guards), 1)
         guard = self.guards[0]
-        self.assertEqual(guard.origin, "out-parameter 1 (&var_10)")
+        self.assertEqual(guard.origin, "pointer argument 1 (&var_10)")
         self.assertEqual(guard.true_side.call_names, ["CreateProcessW"])
+
+
+class TestPointerArgumentPrecision(unittest.TestCase):
+    """A pointer argument is only a lead, so the obvious false leads are cut."""
+
+    def _function(self, tail, params, callee_parameters=None):
+        status = h.Variable("status")
+        eax = h.SSAVariable(h.Variable("eax"), 1)
+        instructions = [call(0x1000, REG_QUERY, output=[eax], params=params(status))]
+        instructions.extend(tail(status))
+        func = diamond_function(
+            instructions, [(0, 2), (2, 3), (3, 4)],
+            {0: [1, 2], 1: [2], 2: []})
+        callee = h.Function("RegQueryValueExW", REG_QUERY, None,
+                            parameters=callee_parameters)
+        bv = h.FakeBinaryView(symbols=SYMBOLS, functions=[func, callee])
+        return func, bv
+
+    def _overwritten_then_tested(self, status):
+        """`Api(&status); status = 1; if (status)` — the test is of the 1."""
+        written = h.SSAVariable(status, 2)
+        assignment = h.Expr("MLIL_SET_VAR_SSA", [written, h.const(1)],
+                            address=0x1006, dest=written, src=h.const(1))
+        return [
+            assignment,
+            branch(0x100c,
+                   h.cmp_expr("MLIL_CMP_E", h.var_ssa(written), h.const(0), "=="),
+                   2, 3, reads=[written]),
+            call(0x1010, CREATE_PROCESS),
+            h.Expr("MLIL_RET", [], address=0x1020),
+        ]
+
+    def _read_then_tested(self, status):
+        """The API's write has no definition in the IL — this one is real."""
+        filled = h.SSAVariable(status, 2)
+        return [
+            h.Expr("MLIL_NOP", [], address=0x1006),
+            branch(0x100c,
+                   h.cmp_expr("MLIL_CMP_E", h.var_ssa(filled), h.const(0), "=="),
+                   2, 3, reads=[filled]),
+            call(0x1010, CREATE_PROCESS),
+            h.Expr("MLIL_RET", [], address=0x1020),
+        ]
+
+    def test_value_the_caller_overwrote_is_not_the_api_result(self):
+        func, bv = self._function(self._overwritten_then_tested,
+                                  lambda s: [h.address_of(s)])
+        guards, _ = branches.analyze_function_branches(
+            bv, func, [(0x1000, "RegQueryValueExW")])
+        self.assertEqual(guards, [])
+
+    def test_a_value_only_the_api_could_have_written_is_tracked(self):
+        func, bv = self._function(self._read_then_tested,
+                                  lambda s: [h.address_of(s)])
+        guards, _ = branches.analyze_function_branches(
+            bv, func, [(0x1000, "RegQueryValueExW")])
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0].origin, "pointer argument 1 (&status)")
+
+    def test_pointer_to_const_parameter_is_an_input_and_is_skipped(self):
+        func, bv = self._function(
+            self._read_then_tested,
+            lambda s: [h.address_of(s)],
+            callee_parameters=[h.Parameter(h.pointer_to(const=True))],
+        )
+        guards, untested = branches.analyze_function_branches(
+            bv, func, [(0x1000, "RegQueryValueExW")])
+        self.assertEqual(guards, [])
+        self.assertEqual(len(untested), 1)
+
+    def test_non_const_pointer_parameter_is_still_tracked(self):
+        func, bv = self._function(
+            self._read_then_tested,
+            lambda s: [h.address_of(s)],
+            callee_parameters=[h.Parameter(h.pointer_to(const=False))],
+        )
+        guards, _ = branches.analyze_function_branches(
+            bv, func, [(0x1000, "RegQueryValueExW")])
+        self.assertEqual(len(guards), 1)
+
+
+class TestArmEntryAddress(unittest.TestCase):
+    """The arm starts where the branch jumps, not at the lowest block index."""
+
+    def setUp(self):
+        eax = h.SSAVariable(h.Variable("eax"), 1)
+        instructions = [
+            call(0x1000, REG_QUERY, output=[eax]),          # block 0
+            h.Expr("MLIL_GOTO", [3], address=0x1006),       # block 1
+            call(0x1010, WRITE_FILE),                       # block 2
+            branch(0x1020,
+                   h.cmp_expr("MLIL_CMP_NE", h.var_ssa(eax), h.const(0), "!="),
+                   4, 5, reads=[eax]),                      # block 3
+            call(0x1030, CREATE_PROCESS),                   # block 4
+            h.Expr("MLIL_RET", [], address=0x1040),         # block 5
+        ]
+        # Block 2 is reached only through block 4, so it is guarded by the true
+        # arm while sorting before the block the branch actually targets.
+        self.func = diamond_function(
+            instructions,
+            [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)],
+            {0: [1], 1: [3], 2: [5], 3: [4, 5], 4: [2], 5: []},
+        )
+        self.bv = build_bv([self.func])
+        self.guards, _ = branches.analyze_function_branches(
+            self.bv, self.func, [(0x1000, "RegQueryValueExW")])
+
+    def test_entry_is_the_branch_target(self):
+        true_side = self.guards[0].true_side
+        self.assertEqual(true_side.blocks, 2)
+        self.assertEqual(true_side.entry, 0x1030)
+
+    def test_the_whole_guarded_region_is_still_reported(self):
+        self.assertEqual(sorted(self.guards[0].true_side.call_names),
+                         ["CreateProcessW", "WriteFile"])
 
 
 class TestUntestedResults(unittest.TestCase):

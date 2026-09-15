@@ -26,11 +26,14 @@ anything:
 - **Intraprocedural.** Propagation stops at the function boundary. If the
   result is returned or handed to a helper, that is reported as an untested
   use naming where the value went, not followed into the callee.
-- **Out-parameters are matched by variable, not by memory.** A write the API
+- **Pointer arguments are matched by variable, not by memory.** A write the API
   performs through a pointer is invisible in the caller's IL, so reads of the
   variable whose address was passed are treated as carrying the API's data
-  from the call site onward. A variable reused for something else afterwards
-  can therefore over-report.
+  from the call site onward. Nothing in the IL says which pointer arguments are
+  outputs: a parameter the callee's type declares pointer-to-const is dropped,
+  and the rest are reported as *pointer argument N* rather than as verified
+  out-parameters. A variable reused afterwards, or an input-only pointer into
+  an untyped callee, can therefore over-report.
 - **The condition is reported, not interpreted.** Which arm means "success"
   depends on the API's contract — `RegOpenKeyExW` returns 0 on success while
   `CreateFileW` returns -1 on failure — so both arms are shown with their
@@ -48,7 +51,12 @@ from binaryninja import BinaryView
 from binaryninja.log import log_warn
 
 from . import cfgutil
-from .core import PLUGIN_NAME, resolve_targets, unmatched_patterns
+from .core import (
+    PLUGIN_NAME,
+    matched_symbol_names,
+    resolve_targets,
+    unmatched_patterns,
+)
 
 # How many assignments a value may pass through before we stop following it.
 # Compilers rarely put more than a couple of copies between a call and the
@@ -192,13 +200,17 @@ def _expr_text(expr) -> str:
 
 
 def _collect_ssa_vars(expr, depth: int = 0, out: Optional[List] = None) -> List:
-    """Every SSA variable read anywhere inside an expression tree."""
+    """Every SSA variable appearing anywhere inside an expression tree."""
     if out is None:
         out = []
     if depth > 24 or expr is None:
         return out
     if _is_ssa_var(expr):
         out.append(expr)
+        return out
+    if isinstance(expr, (list, tuple)):
+        for item in expr:
+            _collect_ssa_vars(item, depth + 1, out)
         return out
     operands = getattr(expr, "operands", None)
     if operands is None:
@@ -210,6 +222,27 @@ def _collect_ssa_vars(expr, depth: int = 0, out: Optional[List] = None) -> List:
         else:
             _collect_ssa_vars(operand, depth + 1, out)
     return out
+
+
+def _ssa_vars_read(inst) -> List:
+    """
+    The SSA variables an instruction reads, excluding the one it defines.
+
+    Walking every operand would count an assignment's destination as a read, so
+    `Api(&status); status = 1; if (status)` would seed the fresh definition of
+    `status` and blame the API for a condition testing a value it never
+    produced.
+    """
+    if _op(inst) in _ASSIGN_OPS:
+        out: List = []
+        # `src` carries the value assigned (a list of versions for a phi);
+        # `prev` is the previous version a partial write builds on.
+        for attr in ("src", "prev"):
+            value = getattr(inst, attr, None)
+            if value is not None:
+                _collect_ssa_vars(value, out=out)
+        return out
+    return _collect_ssa_vars(inst)
 
 
 def _reads(expr, ssa_var) -> bool:
@@ -301,6 +334,39 @@ def _call_target_name(bv: BinaryView, inst) -> str:
     return hex(addr)
 
 
+def _const_value(attr) -> bool:
+    """Unwrap a Binary Ninja confidence-wrapped bool, which is always truthy."""
+    return bool(getattr(attr, "value", attr))
+
+
+def _input_only_params(bv: BinaryView, call_inst) -> Set[int]:
+    """
+    Positions of parameters the callee declares as pointer-to-const.
+
+    A `const` pointer is an input by declaration, so whatever the caller passes
+    there is not something the API filled in — `&si` handed to `CreateProcessW`
+    rather than `&pi`. Where Binary Ninja has no type for the callee, which is
+    the common case for an import from a binary without type libraries, this
+    returns nothing and decides nothing.
+    """
+    dest = getattr(call_inst, "dest", None)
+    addr = getattr(dest, "constant", None)
+    if addr is None:
+        return set()
+    try:
+        callee = bv.get_function_at(addr)
+        params = callee.function_type.parameters if callee is not None else None
+    except Exception:
+        return set()
+
+    positions: Set[int] = set()
+    for position, param in enumerate(params or (), start=1):
+        pointee = getattr(getattr(param, "type", None), "target", None)
+        if pointee is not None and _const_value(getattr(pointee, "const", False)):
+            positions.add(position)
+    return positions
+
+
 def _block_graph(il) -> Tuple[Dict[int, List[int]], Dict[int, object], Optional[int]]:
     """Adjacency map over IL basic block indices, plus the blocks themselves."""
     graph: Dict[int, List[int]] = {}
@@ -328,33 +394,17 @@ def _block_graph(il) -> Tuple[Dict[int, List[int]], Dict[int, object], Optional[
 # Seeding: what the call produced
 # --------------------------------------------------------------------------
 
-def _out_param_seeds(il, call_inst, call_addr: int, graph, blocks,
-                     call_block_index: Optional[int]) -> List[Tuple[object, str]]:
+def _downstream_instructions(il, graph, blocks, call_addr: int,
+                             call_block_index: Optional[int]):
     """
-    Seeds for arguments passed as `&var`.
+    The instructions a call can reach, in block order, capped.
 
-    Binary Ninja cannot see the API writing through the pointer, so the write
-    never appears in the caller's IL. Reads of that variable from the call site
-    onward are therefore treated as carrying whatever the API stored — an
-    approximation, and the reason this can over-report when a variable is
-    reused later for something unrelated.
+    Within the call's own block only what follows the call counts; a later
+    block reached by a back edge is downstream even though its addresses are
+    lower.
     """
-    pointed_at = []
-    for position, param in enumerate(_params(call_inst), start=1):
-        if _op(param) != "MLIL_ADDRESS_OF":
-            continue
-        var = getattr(param, "src", None)
-        if var is None:
-            continue
-        pointed_at.append((var, f"out-parameter {position} (&{var})"))
-    if not pointed_at:
-        return []
-
     downstream = (cfgutil.reachable(graph, call_block_index)
                   if call_block_index is not None else set(blocks))
-
-    seeds: List[Tuple[object, str]] = []
-    seen: Set[Tuple] = set()
     scanned = 0
     for index in sorted(downstream):
         block = blocks.get(index)
@@ -363,31 +413,85 @@ def _out_param_seeds(il, call_inst, call_addr: int, graph, blocks,
         for i in range(block.start, block.end):
             scanned += 1
             if scanned > MAX_OUT_PARAM_SCAN:
-                return seeds
+                return
             try:
                 inst = il[i]
             except Exception:
                 continue
-            # Within the call's own block, only code after the call can be
-            # reading what the call stored.
-            if inst.address <= call_addr and index == call_block_index:
+            if index == call_block_index and inst.address <= call_addr:
                 continue
-            for ssa_var in _collect_ssa_vars(inst):
-                for var, origin in pointed_at:
-                    if getattr(ssa_var, "var", None) != var:
-                        continue
-                    key = _var_key(ssa_var)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    seeds.append((ssa_var, origin))
+            yield index, inst
+
+
+def _out_param_seeds(bv: BinaryView, il, call_inst, call_addr: int, graph,
+                     blocks,
+                     call_block_index: Optional[int]) -> List[Tuple[object, str]]:
+    """
+    Seeds for arguments passed as `&var`.
+
+    Binary Ninja cannot see the API writing through the pointer, so the write
+    never appears in the caller's IL. Reads of that variable from the call site
+    onward are therefore treated as carrying whatever the API stored.
+
+    Which pointer arguments are genuinely outputs is not something the IL says.
+    Where the callee's type is known, a pointer-to-const parameter is dropped —
+    it is an input by declaration. The rest are kept and reported as *pointer
+    argument N*, not as verified out-parameters, because dropping the unknown
+    ones would discard the case this analysis exists for: `RegQueryValueExW`
+    returns a status code and hands back the data you branch on through
+    `&buffer`. The cost is that an input-only pointer whose variable is tested
+    later can produce a guard the API did not really cause.
+    """
+    input_only = _input_only_params(bv, call_inst)
+
+    pointed_at = []
+    for position, param in enumerate(_params(call_inst), start=1):
+        if _op(param) != "MLIL_ADDRESS_OF" or position in input_only:
+            continue
+        var = getattr(param, "src", None)
+        if var is None:
+            continue
+        pointed_at.append((var, f"pointer argument {position} (&{var})"))
+    if not pointed_at:
+        return []
+
+    tracked = {var for var, _ in pointed_at}
+
+    # A version of the variable that the caller itself defines after the call
+    # holds the caller's value, not the API's: in `Api(&status); status = 1;
+    # if (status)` the test is of the 1, and blaming the API for it would be a
+    # guard that never existed. The API's own write has no definition in the IL
+    # at all — that is what makes it invisible — so caller-defined versions are
+    # exactly the ones to drop.
+    redefined: Set[Tuple] = set()
+    for _index, inst in _downstream_instructions(il, graph, blocks, call_addr,
+                                                 call_block_index):
+        if _op(inst) not in _ASSIGN_OPS:
+            continue
+        dest = getattr(inst, "dest", None)
+        if _is_ssa_var(dest) and getattr(dest, "var", None) in tracked:
+            redefined.add(_var_key(dest))
+
+    seeds: List[Tuple[object, str]] = []
+    seen: Set[Tuple] = set()
+    for _index, inst in _downstream_instructions(il, graph, blocks, call_addr,
+                                                 call_block_index):
+        for ssa_var in _ssa_vars_read(inst):
+            for var, origin in pointed_at:
+                if getattr(ssa_var, "var", None) != var:
+                    continue
+                key = _var_key(ssa_var)
+                if key in seen or key in redefined:
+                    continue
+                seen.add(key)
+                seeds.append((ssa_var, origin))
     return seeds
 
 
-def _seeds_for_call(il, call_inst, call_addr, graph, blocks,
+def _seeds_for_call(bv: BinaryView, il, call_inst, call_addr, graph, blocks,
                     call_block_index) -> List[Tuple[object, str]]:
     seeds = [(var, "return value") for var in _output_vars(call_inst)]
-    seeds.extend(_out_param_seeds(il, call_inst, call_addr, graph, blocks,
+    seeds.extend(_out_param_seeds(bv, il, call_inst, call_addr, graph, blocks,
                                   call_block_index))
     return seeds
 
@@ -456,20 +560,23 @@ def _trace_to_conditions(il, seeds, max_hops: int):
 # --------------------------------------------------------------------------
 
 def _summarise_side(bv: BinaryView, il, blocks, region: Set[int],
-                    taken: bool) -> GuardedSide:
+                    taken: bool, target: int) -> GuardedSide:
     side = GuardedSide(taken=taken, blocks=len(region))
     if not region:
         return side
 
-    ordered = sorted(region)
-    first = blocks.get(ordered[0])
+    # The arm starts where the branch sends control, which is not the lowest
+    # block index in the region: a backward edge can put another guarded block
+    # first, and navigating there would land the reader in the middle of the
+    # arm rather than at its top.
+    first = blocks.get(target)
     if first is not None:
         try:
             side.entry = il[first.start].address
         except Exception:
             side.entry = getattr(getattr(first, "source_block", None), "start", None)
 
-    for index in ordered:
+    for index in sorted(region):
         block = blocks.get(index)
         if block is None:
             continue
@@ -513,8 +620,10 @@ def _build_guard(bv: BinaryView, func, il, graph, blocks, entry: Optional[int],
         condition_site=if_inst.address,
         condition=_expr_text(getattr(if_inst, "condition", None)),
         hops=hops,
-        true_side=_summarise_side(bv, il, blocks, true_region, True),
-        false_side=_summarise_side(bv, il, blocks, false_region, False),
+        true_side=_summarise_side(bv, il, blocks, true_region, True,
+                                  true_block.index),
+        false_side=_summarise_side(bv, il, blocks, false_region, False,
+                                   false_block.index),
     )
 
 
@@ -554,7 +663,8 @@ def analyze_function_branches(
         except Exception:
             pass
 
-        seeds = _seeds_for_call(il, call_inst, call_addr, graph, blocks, call_block)
+        seeds = _seeds_for_call(bv, il, call_inst, call_addr, graph, blocks,
+                                call_block)
         if not seeds:
             untested.append(UntestedCall(func, api, call_addr,
                                          ["the call has no result in IL"]))
@@ -638,7 +748,7 @@ def find_api_branches(
     result.guards.sort(key=lambda g: (g.function.name.lower(), g.call_site))
     result.untested.sort(key=lambda u: (u.function.name.lower(), u.call_site))
     result.unmatched_patterns = unmatched_patterns(
-        patterns, set(targets.values()), mode, case_sensitive)
+        patterns, matched_symbol_names(bv, targets), mode, case_sensitive)
     return result
 
 
