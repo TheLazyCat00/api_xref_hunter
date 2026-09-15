@@ -38,7 +38,7 @@ from binaryninja import execute_on_main_thread
 from binaryninja.log import log_error, log_info
 from binaryninja.plugin import BackgroundTaskThread
 
-from . import core
+from . import branches, core
 
 WIDGET_NAME = "API Hunter"
 
@@ -100,8 +100,12 @@ class _ScanTask(BackgroundTaskThread):
                 max_depth=self.depth,
             )
         except Exception as exc:
+            # Bind the text here: `exc` is unbound once the except block ends,
+            # so a lambda capturing it would raise on the main thread instead
+            # of showing the failure.
+            message = f"Failed: {exc}"
             log_error(f"API Xref Hunter: scan failed: {exc}")
-            execute_on_main_thread(lambda: self.widget.set_status(f"Failed: {exc}"))
+            execute_on_main_thread(lambda: self.widget.set_status(message))
             return
         execute_on_main_thread(lambda: self.widget.populate(result))
 
@@ -128,6 +132,34 @@ class _ReachTask(BackgroundTaskThread):
             log_error(f"API Xref Hunter: reachability failed: {exc}")
             return
         execute_on_main_thread(lambda: self.widget.show_chain(self.func, chain))
+
+
+class _BranchTask(BackgroundTaskThread):
+    """What does the function at the cursor do with these APIs' results?"""
+
+    def __init__(self, widget, bv, func, patterns, mode):
+        # One function's worth of analysis, with no interruption point to
+        # check a cancel flag at — offering a cancel button that does nothing
+        # would be worse than not offering one.
+        super().__init__("API Hunter: branches…", can_cancel=False)
+        self.widget = widget
+        self.bv = bv
+        self.func = func
+        self.patterns = patterns
+        self.mode = mode
+
+    def run(self):
+        try:
+            result = branches.find_api_branches(
+                self.bv, self.patterns, mode=self.mode, functions=[self.func],
+            )
+        except Exception as exc:
+            message = f"Failed: {exc}"
+            log_error(f"API Xref Hunter: branch analysis failed: {exc}")
+            execute_on_main_thread(lambda: self.widget.set_status(message))
+            return
+        execute_on_main_thread(
+            lambda: self.widget.populate_branches(self.func, result))
 
 
 class ApiHunterSidebarWidget(SidebarWidget):
@@ -176,14 +208,26 @@ class ApiHunterSidebarWidget(SidebarWidget):
         self.scan_btn = QPushButton("Scan")
         self.scan_btn.clicked.connect(self.scan)
         row.addWidget(self.scan_btn)
+        layout.addLayout(row)
 
+        # The two questions about the function at the cursor get their own row:
+        # four controls on one line is unreadable at sidebar widths.
+        here = QHBoxLayout()
         self.reach_btn = QPushButton("Reaches?")
         self.reach_btn.setToolTip(
             "Does the function at the current offset ever reach a matching API?"
         )
         self.reach_btn.clicked.connect(self.check_reach)
-        row.addWidget(self.reach_btn)
-        layout.addLayout(row)
+        here.addWidget(self.reach_btn)
+
+        self.branch_btn = QPushButton("Branches?")
+        self.branch_btn.setToolTip(
+            "What does the function at the current offset do differently "
+            "depending on what a matching API returned?"
+        )
+        self.branch_btn.clicked.connect(self.check_branches)
+        here.addWidget(self.branch_btn)
+        layout.addLayout(here)
 
         # --- results
         self.tree = QTreeWidget()
@@ -352,22 +396,42 @@ class ApiHunterSidebarWidget(SidebarWidget):
         ).start()
 
     def check_reach(self):
-        if self.data is None:
-            self.set_status("No binary view active.")
+        func = self._function_at_cursor()
+        if func is None:
             return
         pats = self._collect_patterns()
         if not pats:
             self.set_status("No patterns given.")
             return
+        self.set_status("Checking reachability…")
+        _ReachTask(
+            self, self.data, func, pats, self.mode.currentText(),
+            max(self.depth.value(), 8), True,
+        ).start()
+
+    def check_branches(self):
+        """Analyse what the function at the cursor does with these APIs' results."""
+        func = self._function_at_cursor()
+        if func is None:
+            return
+        pats = self._collect_patterns()
+        if not pats:
+            self.set_status("No patterns given.")
+            return
+        self.set_status(f"Analysing branches in {func.name}…")
+        self.tree.clear()
+        _BranchTask(self, self.data, func, pats, self.mode.currentText()).start()
+
+    def _function_at_cursor(self):
+        """The function the cursor sits in, or None with the reason on screen."""
+        if self.data is None:
+            self.set_status("No binary view active.")
+            return None
         funcs = self.data.get_functions_containing(self._current_offset) or []
         if not funcs:
             self.set_status("Cursor is not inside a function.")
-            return
-        self.set_status("Checking reachability…")
-        _ReachTask(
-            self, self.data, funcs[0], pats, self.mode.currentText(),
-            max(self.depth.value(), 8), True,
-        ).start()
+            return None
+        return funcs[0]
 
     # -- rendering ---------------------------------------------------------
 
@@ -437,6 +501,90 @@ class ApiHunterSidebarWidget(SidebarWidget):
                 item.setText(1, hex(fn.start))
         self.apply_column_width()
         self.set_status(f"Shortest chain: {len(chain) - 1} hop(s).")
+
+
+    def populate_branches(self, func, result):
+        """
+        Show each conditional that tests an API result, and what its arms guard.
+
+        The tree reads top down as the question does: the API call, the test it
+        feeds, then one row per arm naming the calls that only happen if the
+        branch goes that way.
+        """
+        self.tree.clear()
+
+        if not result.call_sites:
+            self.set_status(f"{func.name} calls no matching API.")
+            return
+
+        if result.guards:
+            root = QTreeWidgetItem(
+                self.tree, [f"Branches on API results ({len(result.guards)})", ""])
+            root.setExpanded(True)
+            bold = root.font(0)
+            bold.setBold(True)
+            root.setFont(0, bold)
+
+            for guard in result.guards:
+                node = QTreeWidgetItem(
+                    root,
+                    [f"{guard.api} → if ({guard.condition})",
+                     hex(guard.condition_site)],
+                )
+                node.setData(0, Qt.UserRole, guard.condition_site)
+                node.setExpanded(True)
+                hops = ("tested directly" if guard.hops == 0
+                        else f"{guard.hops} assignment(s) later")
+                node.setToolTip(
+                    0,
+                    f"call at {hex(guard.call_site)} — {guard.origin}, {hops}",
+                )
+
+                call_row = QTreeWidgetItem(node, ["call site", hex(guard.call_site)])
+                call_row.setData(0, Qt.UserRole, guard.call_site)
+
+                for side in guard.sides:
+                    if side.is_empty:
+                        QTreeWidgetItem(node, [f"{side.label}: nothing of its own", ""])
+                        continue
+                    names = side.call_names
+                    summary = ", ".join(names[:6]) if names else "no calls"
+                    if len(names) > 6:
+                        summary += f" (+{len(names) - 6})"
+                    if side.returns:
+                        summary += " — returns"
+                    arm = QTreeWidgetItem(
+                        node,
+                        [f"{side.label}: {summary}",
+                         hex(side.entry) if side.entry is not None else ""],
+                    )
+                    if side.entry is not None:
+                        arm.setData(0, Qt.UserRole, side.entry)
+                    for addr, name in side.calls[:32]:
+                        leaf = QTreeWidgetItem(arm, [name, hex(addr)])
+                        leaf.setData(0, Qt.UserRole, addr)
+
+        if result.untested:
+            group = QTreeWidgetItem(
+                self.tree,
+                [f"Results no branch tests ({len(result.untested)})", ""])
+            group.setExpanded(True)
+            bold = group.font(0)
+            bold.setBold(True)
+            group.setFont(0, bold)
+            for call in result.untested:
+                item = QTreeWidgetItem(group, [call.api, hex(call.call_site)])
+                item.setData(0, Qt.UserRole, call.call_site)
+                if call.fate:
+                    item.setToolTip(0, "; ".join(call.fate))
+
+        self.apply_column_width()
+        self.set_status(
+            f"{func.name}: {len(result.guards)} branch(es) on an API result "
+            f"from {result.call_sites} call site(s)"
+            + (f", {len(result.untested)} result(s) untested." if result.untested
+               else ".")
+        )
 
 
 class ApiHunterSidebarWidgetType(SidebarWidgetType):

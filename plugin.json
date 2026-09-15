@@ -7,8 +7,8 @@
     "api": [
         "python3"
     ],
-    "description": "Find every function that calls any API from a configurable set of names.",
-    "longdescription": "Define a set of API names (glob, regex, substring or exact match) and get every function in the binary that calls any of them, grouped by caller. Ships with editable presets for registry, network, process injection, crypto, filesystem, dynamic resolution and anti-analysis APIs. Supports transitive caller discovery, a clickable markdown report, and optional tagging so hits appear in the Tags sidebar.",
+    "description": "Find every function that calls any API from a configurable set of names, and what the binary does with what those APIs return.",
+    "longdescription": "Define a set of API names (glob, regex, substring or exact match) and get every function in the binary that calls any of them, grouped by caller. Ships with editable presets for registry, network, process injection, crypto, filesystem, dynamic resolution and anti-analysis APIs. Supports transitive caller discovery, a clickable markdown report, and optional tagging so hits appear in the Tags sidebar.\n\nBranch analysis answers the other half of the question: which conditionals test what an API returned, and what code each arm of those conditionals guards. It follows the return value and any out-parameter through MLIL SSA def-use to the `if` that reads them, then reports the calls that only happen because the branch went one way \u2014 so you can see the block a registry read actually gates, and which API results it does not branch-test locally.",
     "license": {
         "name": "MIT",
         "text": "Copyright (c) 2026\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
@@ -24,7 +24,7 @@
         "Windows": "no special instructions, package manager is recommended"
     },
     "dependencies": {},
-    "version": "1.1.0",
+    "version": "1.2.0",
     "author": "Manuel",
     "minimumbinaryninjaversion": 4000
 }

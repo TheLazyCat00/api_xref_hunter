@@ -280,6 +280,46 @@ def _symbol_names(sym) -> Set[str]:
     return names
 
 
+def matched_symbol_names(bv: BinaryView, addresses: Iterable[int]) -> Set[str]:
+    """Every spelling of the symbols at these addresses, for `unmatched_patterns`."""
+    names: Set[str] = set()
+    for address in addresses:
+        try:
+            sym = bv.get_symbol_at(address)
+        except Exception:
+            continue
+        if sym is not None:
+            names |= _symbol_names(sym)
+    return names
+
+
+def unmatched_patterns(
+    patterns: Sequence[str],
+    matched_names: Iterable[str],
+    mode: str = "glob",
+    case_sensitive: bool = False,
+) -> List[str]:
+    """
+    Which patterns resolved to no symbol at all.
+
+    That is the signal that an API is either absent from the binary or resolved
+    dynamically at runtime, so it is worth reporting rather than passing over.
+
+    `matched_names` must carry every spelling the resolution matched against,
+    not just each symbol's canonical name: resolution tries the decorated and
+    stripped forms too, so an exact-mode `RegOpenKeyExW` that matched a symbol
+    named `_RegOpenKeyExW@20` would otherwise be reported as unmatched when it
+    plainly matched. `matched_symbol_names` builds that set from addresses.
+    """
+    names = list(matched_names)
+    out = []
+    for pattern in patterns:
+        single = _build_matcher([pattern], mode, case_sensitive)
+        if not any(single(name) for name in names):
+            out.append(pattern)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Results
 # --------------------------------------------------------------------------
@@ -342,12 +382,14 @@ def find_api_callers(
 
     # 1. Resolve patterns to concrete symbol addresses.
     targets: Dict[int, str] = {}   # address -> display name
+    matched_names: Set[str] = set()
     for sym in bv.get_symbols():
         if sym.type not in allowed_types:
             continue
         names = _symbol_names(sym)
         if any(matcher(n) for n in names):
             targets[sym.address] = sym.name
+            matched_names |= names
 
     if not targets:
         result.unmatched_patterns = list(patterns)
@@ -399,11 +441,8 @@ def find_api_callers(
     result.callers = sorted(hits.values(), key=lambda h: (h.depth, h.name.lower()))
 
     # 4. Report patterns that matched nothing at all.
-    matched_names = set(targets.values())
-    for pat in patterns:
-        single = _build_matcher([pat], mode, case_sensitive)
-        if not any(single(n) for n in matched_names):
-            result.unmatched_patterns.append(pat)
+    result.unmatched_patterns = unmatched_patterns(
+        patterns, matched_names, mode, case_sensitive)
 
     return result
 
